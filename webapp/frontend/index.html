@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LeafCutter2 Pipeline</title>
+<style>
+  :root {
+    --bg: #f8f9fa; --surface: #fff; --border: #dee2e6; --text: #212529;
+    --muted: #6c757d; --accent: #0d6efd; --accent-hover: #0b5ed7;
+    --red: #dc3545; --green: #198754; --yellow: #ffc107; --radius: 8px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; }
+  .container { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
+  h1 { font-size: 1.6rem; margin-bottom: 4px; }
+  .subtitle { color: var(--muted); margin-bottom: 24px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; margin-bottom: 16px; }
+  .card h2 { font-size: 1.1rem; margin-bottom: 12px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+  label { display: block; font-weight: 600; font-size: 0.875rem; margin-top: 10px; margin-bottom: 2px; }
+  input, select { width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 4px; font-size: 0.9rem; }
+  input:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px rgba(13,110,253,.15); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+  .btn { display: inline-block; padding: 10px 20px; border: none; border-radius: 4px; font-size: 0.95rem; font-weight: 600; cursor: pointer; transition: background .15s; }
+  .btn-primary { background: var(--accent); color: #fff; width: 100%; }
+  .btn-primary:hover { background: var(--accent-hover); }
+  .btn-danger { background: var(--red); color: #fff; }
+  .btn-danger:hover { background: #bb2d3b; }
+  .btn-success { background: var(--green); color: #fff; }
+  .btn-success:hover { background: #157347; }
+  .btn-sm { padding: 6px 14px; font-size: 0.85rem; }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .hidden { display: none; }
+  .status-badge { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 0.8rem; font-weight: 600; text-transform: uppercase; }
+  .status-queued { background: #e2e3e5; color: #41464b; }
+  .status-submitted { background: #cff4fc; color: #055160; }
+  .status-running { background: #fff3cd; color: #664d03; }
+  .status-succeeded { background: #d1e7dd; color: #0f5132; }
+  .status-failed { background: #f8d7da; color: #842029; }
+  .status-cancelled { background: #e2e3e5; color: #41464b; }
+  pre { background: #f1f3f5; border: 1px solid var(--border); border-radius: 4px; padding: 12px; overflow-x: auto; font-size: 0.82rem; max-height: 400px; overflow-y: auto; white-space: pre-wrap; word-break: break-word; }
+  .meta-row { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 8px; font-size: 0.85rem; color: var(--muted); }
+  .meta-row span { white-space: nowrap; }
+  .actions { display: flex; gap: 8px; margin-top: 12px; }
+  .slurm-fields { transition: max-height .3s ease; overflow: hidden; }
+  .hint { font-size: 0.78rem; color: var(--muted); margin-top: 2px; }
+  .source-radios { display: flex; gap: 20px; margin-bottom: 8px; }
+  .source-radios label { display: inline-flex; align-items: center; gap: 6px; font-weight: 500; cursor: pointer; }
+  .source-radios input[type="radio"] { width: auto; }
+  .tissue-select { width: 100%; height: 220px; border: 1px solid var(--border); border-radius: 4px; font-size: 0.85rem; padding: 4px; }
+  .tissue-actions { display: flex; gap: 8px; margin-top: 6px; }
+  .tissue-actions button { padding: 4px 12px; font-size: 0.78rem; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); cursor: pointer; }
+  .tissue-actions button:hover { background: #e9ecef; }
+  .tissue-count { font-size: 0.78rem; color: var(--muted); margin-top: 4px; }
+  .error-box { background: #f8d7da; border: 1px solid #f5c2c7; border-radius: 4px; padding: 10px; margin-top: 8px; color: #842029; font-size: 0.85rem; white-space: pre-wrap; }
+  .tabs { display: flex; gap: 0; border-bottom: 2px solid var(--border); margin-bottom: 12px; }
+  .tab { padding: 8px 16px; cursor: pointer; font-size: 0.9rem; font-weight: 600; color: var(--muted); border-bottom: 2px solid transparent; margin-bottom: -2px; }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>LeafCutter2 Pipeline</h1>
+  <p class="subtitle">Submit genomic junction data, run locally or on Quest (Slurm), view and download results.</p>
+
+  <!-- SUBMIT FORM -->
+  <form id="job-form">
+    <div class="card">
+      <h2>Execution Mode</h2>
+      <select id="mode" name="mode">
+        <option value="local" selected>Local (run on this machine)</option>
+        <option value="slurm">Quest Slurm (submit to HPC cluster)</option>
+      </select>
+    </div>
+
+    <div class="card">
+      <h2>Input Source</h2>
+      <div class="source-radios">
+        <label><input type="radio" name="source" value="upload" checked /> Upload Files</label>
+        <label><input type="radio" name="source" value="gtex" /> GTEx Portal (V8)</label>
+      </div>
+    </div>
+
+    <div class="card" id="upload-card">
+      <h2>Pipeline Inputs</h2>
+      <label for="files">STAR SJ.out.tab files</label>
+      <input id="files" name="files" type="file" multiple accept=".tab,.txt,.tsv" />
+      <p class="hint">Select one or more STAR splice-junction output files.</p>
+      <label for="samples_tsv">Samples TSV (optional)</label>
+      <input id="samples_tsv" name="samples_tsv" type="file" accept=".tsv,.txt,.csv" />
+      <p class="hint">Two-column file: sample &lt;TAB&gt; condition</p>
+    </div>
+
+    <div class="card hidden" id="gtex-card">
+      <h2>GTEx V8 Tissues</h2>
+      <p class="hint" style="margin-bottom:8px;">Select one or more GTEx tissues. Junction data will be downloaded from the GTEx Portal (~4 GB total on first run) and converted to per-sample BED files.</p>
+      <label for="gtex-tissue-select">Tissues (hold Ctrl/Cmd for multi-select)</label>
+      <select id="gtex-tissue-select" class="tissue-select" multiple></select>
+      <div class="tissue-actions">
+        <button type="button" id="tissue-select-all">Select All</button>
+        <button type="button" id="tissue-deselect-all">Deselect All</button>
+      </div>
+      <div class="tissue-count" id="tissue-count">Loading tissue list...</div>
+    </div>
+
+    <div class="card">
+      <h2>Parameters</h2>
+      <div class="grid3">
+        <div>
+          <label for="prefix">Run Prefix</label>
+          <input id="prefix" name="prefix" value="web_run" />
+        </div>
+        <div>
+          <label for="min_reads">Min Reads</label>
+          <input id="min_reads" name="min_reads" type="number" value="50" min="1" />
+        </div>
+        <div>
+          <label for="max_intron_len">Max Intron Len</label>
+          <input id="max_intron_len" name="max_intron_len" type="number" value="500000" min="1000" />
+        </div>
+      </div>
+    </div>
+
+    <div class="card slurm-fields" id="slurm-card">
+      <h2>Quest Slurm Settings</h2>
+      <div class="grid2">
+        <div>
+          <label for="quest_user">Quest Username (NetID)</label>
+          <input id="quest_user" name="quest_user" placeholder="abc123" />
+        </div>
+        <div>
+          <label for="quest_host">Quest Host</label>
+          <input id="quest_host" name="quest_host" value="login.quest.northwestern.edu" />
+        </div>
+      </div>
+      <div class="grid2">
+        <div>
+          <label for="quest_account">Slurm Account</label>
+          <input id="quest_account" name="quest_account" placeholder="b1042" />
+        </div>
+        <div>
+          <label for="quest_partition">Partition</label>
+          <input id="quest_partition" name="quest_partition" placeholder="genomicsguest" />
+        </div>
+      </div>
+      <label for="remote_repo_root">Leaf_Cutter Repo Path on Quest</label>
+      <input id="remote_repo_root" name="remote_repo_root" placeholder="/projects/pXXXXX/Leaf_Cutter" />
+      <label for="remote_work_root">Remote Job Directory Root</label>
+      <input id="remote_work_root" name="remote_work_root" value="~/leafcutter_jobs" />
+      <label for="remote_juncfiles">Remote Junction File List (skip upload)</label>
+      <input id="remote_juncfiles" name="remote_juncfiles" placeholder="/projects/.../junction_files.txt" />
+      <p class="hint">If your data is already on Quest, provide the path to the junction file list here.</p>
+    </div>
+
+    <button type="submit" class="btn btn-primary" id="submit-btn">Submit Job</button>
+  </form>
+
+  <!-- JOB STATUS -->
+  <div class="card hidden" id="job-panel">
+    <h2>Job Status</h2>
+    <div style="display:flex; align-items:center; gap:12px;">
+      <span id="badge" class="status-badge status-queued">queued</span>
+      <code id="job-id-display" style="font-size:0.85rem;color:var(--muted);"></code>
+    </div>
+    <div class="meta-row" id="meta-row"></div>
+    <div id="error-box" class="error-box hidden"></div>
+    <div class="actions">
+      <button class="btn btn-danger btn-sm hidden" id="cancel-btn">Cancel Job</button>
+      <button class="btn btn-success btn-sm hidden" id="download-btn">Download Artifacts</button>
+    </div>
+  </div>
+
+  <!-- RESULTS VIEWER -->
+  <div class="card hidden" id="results-panel">
+    <h2>Results</h2>
+    <div class="tabs">
+      <div class="tab active" data-tab="summary-tab">Summary</div>
+      <div class="tab" data-tab="log-tab">Pipeline Log</div>
+    </div>
+    <div id="summary-tab" class="tab-content active">
+      <pre id="summary-json">Waiting for results...</pre>
+    </div>
+    <div id="log-tab" class="tab-content">
+      <pre id="log-content">No log available yet.</pre>
+    </div>
+  </div>
+
+  <!-- PREVIOUS JOBS -->
+  <div class="card">
+    <h2>Recent Jobs</h2>
+    <div id="jobs-list" style="font-size:0.85rem; color:var(--muted);">Loading...</div>
+  </div>
+</div>
+
+<script>
+const $ = (sel) => document.querySelector(sel);
+const form = $("#job-form");
+const slurmCard = $("#slurm-card");
+const modeSelect = $("#mode");
+const jobPanel = $("#job-panel");
+const resultsPanel = $("#results-panel");
+const badge = $("#badge");
+const jobIdDisplay = $("#job-id-display");
+const metaRow = $("#meta-row");
+const errorBox = $("#error-box");
+const cancelBtn = $("#cancel-btn");
+const downloadBtn = $("#download-btn");
+const summaryJson = $("#summary-json");
+const logContent = $("#log-content");
+const submitBtn = $("#submit-btn");
+const uploadCard = $("#upload-card");
+const gtexCard = $("#gtex-card");
+const tissueSelect = $("#gtex-tissue-select");
+const tissueCount = $("#tissue-count");
+
+let currentJobId = null;
+let pollTimer = null;
+
+function getSource() {
+  const checked = document.querySelector('input[name="source"]:checked');
+  return checked ? checked.value : "upload";
+}
+
+function updateSourceUI() {
+  const src = getSource();
+  uploadCard.style.display = src === "upload" ? "block" : "none";
+  gtexCard.style.display = src === "gtex" ? "block" : "none";
+}
+document.querySelectorAll('input[name="source"]').forEach(r =>
+  r.addEventListener("change", updateSourceUI)
+);
+updateSourceUI();
+
+// Toggle slurm fields visibility
+function updateModeUI() {
+  slurmCard.style.display = modeSelect.value === "slurm" ? "block" : "none";
+}
+modeSelect.addEventListener("change", updateModeUI);
+updateModeUI();
+
+// GTEx tissue list
+async function loadTissues() {
+  try {
+    const r = await fetch("/gtex/tissues");
+    if (!r.ok) { tissueCount.textContent = "Failed to load tissues."; return; }
+    const tissues = await r.json();
+    tissueSelect.innerHTML = "";
+    tissues.forEach(t => {
+      const opt = document.createElement("option");
+      opt.value = t.tissue;
+      opt.textContent = `${t.tissue}  (${t.sample_count} samples)`;
+      tissueSelect.appendChild(opt);
+    });
+    tissueCount.textContent = `${tissues.length} tissues available`;
+  } catch (e) {
+    tissueCount.textContent = "Could not load tissue list.";
+  }
+}
+loadTissues();
+
+$("#tissue-select-all").addEventListener("click", () => {
+  Array.from(tissueSelect.options).forEach(o => o.selected = true);
+});
+$("#tissue-deselect-all").addEventListener("click", () => {
+  Array.from(tissueSelect.options).forEach(o => o.selected = false);
+});
+
+// Tabs
+document.querySelectorAll(".tab").forEach(tab => {
+  tab.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+    document.querySelectorAll(".tab-content").forEach(tc => tc.classList.remove("active"));
+    tab.classList.add("active");
+    document.getElementById(tab.dataset.tab).classList.add("active");
+  });
+});
+
+function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+
+function setBadge(status) {
+  badge.textContent = status;
+  badge.className = "status-badge status-" + status;
+}
+
+function showError(msg) {
+  if (msg) { errorBox.textContent = msg; errorBox.classList.remove("hidden"); }
+  else { errorBox.classList.add("hidden"); }
+}
+
+const TERMINAL = new Set(["succeeded", "failed", "cancelled"]);
+const ACTIVE = new Set(["queued", "submitted", "running"]);
+
+async function fetchResults() {
+  if (!currentJobId) return;
+  try {
+    const r = await fetch(`/jobs/${currentJobId}/results`);
+    const d = await r.json();
+    if (d.summary) {
+      summaryJson.textContent = JSON.stringify(d.summary, null, 2);
+    }
+    if (d.log_tail && d.log_tail.length) {
+      logContent.textContent = d.log_tail.join("\n");
+    }
+  } catch (_) {}
+}
+
+async function pollJob() {
+  if (!currentJobId) return;
+  try {
+    const r = await fetch(`/jobs/${currentJobId}`);
+    const d = await r.json();
+    setBadge(d.status);
+
+    let meta = [];
+    if (d.mode) meta.push(`<span>Mode: ${d.mode}</span>`);
+    if (d.quest_job_id) meta.push(`<span>Slurm ID: ${d.quest_job_id}</span>`);
+    if (d.quest_account) meta.push(`<span>Account: ${d.quest_account}</span>`);
+    if (d.quest_partition) meta.push(`<span>Partition: ${d.quest_partition}</span>`);
+    if (d.created_at) meta.push(`<span>Created: ${new Date(d.created_at).toLocaleString()}</span>`);
+    metaRow.innerHTML = meta.join("");
+
+    showError(d.error);
+
+    if (ACTIVE.has(d.status)) {
+      cancelBtn.classList.remove("hidden");
+      downloadBtn.classList.add("hidden");
+    } else {
+      cancelBtn.classList.add("hidden");
+    }
+
+    if (d.status === "succeeded") {
+      downloadBtn.classList.remove("hidden");
+      resultsPanel.classList.remove("hidden");
+      fetchResults();
+    }
+    if (d.status === "failed" || d.status === "cancelled") {
+      resultsPanel.classList.remove("hidden");
+      fetchResults();
+    }
+
+    if (TERMINAL.has(d.status)) {
+      stopPolling();
+      submitBtn.disabled = false;
+    }
+  } catch (e) {
+    console.error("Poll error", e);
+  }
+}
+
+// Submit
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  stopPolling();
+  submitBtn.disabled = true;
+
+  const fd = new FormData(form);
+  fd.set("source", getSource());
+
+  if (getSource() === "gtex") {
+    const selected = Array.from(tissueSelect.selectedOptions).map(o => o.value);
+    if (!selected.length) {
+      showError("Please select at least one GTEx tissue.");
+      submitBtn.disabled = false;
+      return;
+    }
+    fd.set("gtex_tissues_csv", selected.join(","));
+  }
+
+  jobPanel.classList.remove("hidden");
+  resultsPanel.classList.add("hidden");
+  downloadBtn.classList.add("hidden");
+  cancelBtn.classList.add("hidden");
+  errorBox.classList.add("hidden");
+  summaryJson.textContent = "Waiting for results...";
+  logContent.textContent = "No log available yet.";
+  setBadge("queued");
+
+  try {
+    const r = await fetch("/jobs", { method: "POST", body: fd });
+    const d = await r.json();
+    if (!r.ok) {
+      showError(d.detail || d.error || "Submission failed");
+      setBadge("failed");
+      submitBtn.disabled = false;
+      return;
+    }
+    currentJobId = d.job_id;
+    jobIdDisplay.textContent = d.job_id;
+    setBadge(d.status);
+    pollTimer = setInterval(pollJob, 4000);
+    pollJob();
+  } catch (err) {
+    showError("Network error: " + err.message);
+    setBadge("failed");
+    submitBtn.disabled = false;
+  }
+});
+
+// Cancel
+cancelBtn.addEventListener("click", async () => {
+  if (!currentJobId) return;
+  cancelBtn.disabled = true;
+  try {
+    await fetch(`/jobs/${currentJobId}/cancel`, { method: "POST" });
+    pollJob();
+  } catch (_) {}
+  cancelBtn.disabled = false;
+});
+
+// Download
+downloadBtn.addEventListener("click", () => {
+  if (currentJobId) window.location.href = `/jobs/${currentJobId}/download`;
+});
+
+// Recent jobs list
+async function loadJobsList() {
+  const el = $("#jobs-list");
+  try {
+    const r = await fetch("/jobs");
+    const jobs = await r.json();
+    if (!jobs.length) { el.textContent = "No jobs yet."; return; }
+    el.innerHTML = jobs.slice(0, 20).map(j => {
+      const d = new Date(j.created_at).toLocaleString();
+      return `<div style="padding:4px 0; border-bottom:1px solid #eee; display:flex; justify-content:space-between; align-items:center;">
+        <span><code style="font-size:0.8rem;">${j.id.substring(0,8)}...</code> &middot; ${j.mode} &middot; ${d}</span>
+        <span class="status-badge status-${j.status}" style="font-size:0.7rem;">${j.status}</span>
+      </div>`;
+    }).join("");
+  } catch (_) { el.textContent = "Could not load jobs."; }
+}
+loadJobsList();
+</script>
+</body>
+</html>

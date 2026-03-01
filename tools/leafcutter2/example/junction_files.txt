@@ -1,0 +1,12 @@
+data/Brain-FrontalCortex_BA9.GTEX-1192X.chr10.bed.gz
+data/Brain-FrontalCortex_BA9.GTEX-11DXY.chr10.bed.gz
+data/Brain-FrontalCortex_BA9.GTEX-11DYG.chr10.bed.gz
+data/Brain-FrontalCortex_BA9.GTEX-11DZ1.chr10.bed.gz
+data/Brain-FrontalCortex_BA9.GTEX-11EI6.chr10.bed.gz
+data/Brain-FrontalCortex_BA9.GTEX-11EMC.chr10.bed.gz
+data/Cells-EBV-transformedlymphocytes.GTEX-1122O.chr10.bed.gz
+data/Cells-EBV-transformedlymphocytes.GTEX-11EM3.chr10.bed.gz
+data/Cells-EBV-transformedlymphocytes.GTEX-11EMC.chr10.bed.gz
+data/Cells-EBV-transformedlymphocytes.GTEX-11EQ9.chr10.bed.gz
+data/Cells-EBV-transformedlymphocytes.GTEX-11I78.chr10.bed.gz
+data/Cells-EBV-transformedlymphocytes.GTEX-11OC5.chr10.bed.gz

@@ -1,0 +1,46 @@
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+venv/
+.venv/
+
+# Data / large files (download or generate locally)
+junctions/
+junctions_bed/
+junctions_bed_test/
+refs/
+out/
+lc2/
+clusters/
+clustering/
+results/
+figures/
+star_sj/
+*.gz
+*.bed
+*.bam
+*.bai
+*.fa
+*.fasta
+*.gtf
+*.gct
+
+# Webapp runtime data
+webapp/data/jobs/
+webapp/data/jobs.db
+webapp/data/gtex_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PDF docs (large)
+*.pdf
