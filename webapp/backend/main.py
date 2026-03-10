@@ -240,6 +240,42 @@ def run_ssh_cmd(host: str, user: str, remote_cmd: str) -> subprocess.CompletedPr
         ) from RuntimeError(f"SSH failed: {detail}")
 
 
+def _fetch_remote_bytes(host: str, user: str, remote_path: str, byte_offset: int) -> str:
+    """Fetch new content from a remote file starting at byte_offset (non-raising)."""
+    cmd = (
+        ["ssh"] + _ssh_base_opts()
+        + [f"{user}@{host}", f"tail -c +{byte_offset + 1} {remote_path} 2>/dev/null || true"]
+    )
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        return result.stdout or ""
+    except Exception:
+        return ""
+
+
+def _sync_remote_log(
+    host: str, user: str, remote_stdout: str, remote_stderr: str,
+    local_log: Path, stdout_offset: int, stderr_offset: int,
+) -> tuple:
+    """Append new remote stdout/stderr to local pipeline.log. Returns updated offsets."""
+    new_out = _fetch_remote_bytes(host, user, remote_stdout, stdout_offset)
+    new_err = _fetch_remote_bytes(host, user, remote_stderr, stderr_offset)
+    chunk = ""
+    if new_out:
+        chunk += new_out
+    if new_err:
+        for line in new_err.splitlines():
+            if not line.startswith((" ", "\t")) and "......" not in line:
+                chunk += line + "\n"
+    if chunk:
+        with open(local_log, "a") as f:
+            f.write(chunk)
+    return (
+        stdout_offset + len(new_out.encode("utf-8", errors="replace")),
+        stderr_offset + len(new_err.encode("utf-8", errors="replace")),
+    )
+
+
 def run_scp_cmd(srcs: List[str], dest: str, recursive: bool = False) -> subprocess.CompletedProcess:
     cmd = ["scp"] + _ssh_base_opts()
     if recursive:
@@ -478,12 +514,25 @@ def slurm_worker(
         poll_interval = 15
         update_job(job_id, progress_pct=5, progress_label="Submitted to cluster")
 
+        local_work = Path(job["work_dir"])
+        local_log = local_work / "pipeline.log"
+        remote_stdout = f"{remote_run_dir}/slurm_{slurm_id}.out"
+        remote_stderr = f"{remote_run_dir}/slurm_{slurm_id}.err"
+        out_offset = 0
+        err_offset = 0
+
         while True:
             try:
                 sq = run_ssh_cmd(host, user, f"squeue -h -j {slurm_id} -o %T")
                 sq_state = sq.stdout.strip()
             except subprocess.CalledProcessError:
                 sq_state = ""
+
+            # Stream remote logs to local pipeline.log
+            out_offset, err_offset = _sync_remote_log(
+                host, user, remote_stdout, remote_stderr,
+                local_log, out_offset, err_offset,
+            )
 
             if sq_state:
                 mapped = map_slurm_state(sq_state)
@@ -504,11 +553,20 @@ def slurm_worker(
 
             mapped = map_slurm_state(final_state)
 
+            # Final log sync
+            _sync_remote_log(
+                host, user, remote_stdout, remote_stderr,
+                local_log, out_offset, err_offset,
+            )
+
             if mapped == "cancelled":
                 update_job(job_id, status="cancelled", progress_label="Cancelled", error=f"Slurm: {final_state}")
                 return
             if mapped != "succeeded":
-                update_job(job_id, status="failed", progress_label="Failed", error=f"Slurm: {final_state}")
+                # Fetch full stderr for error context
+                full_err = _fetch_remote_bytes(host, user, remote_stderr, 0)
+                err_tail = "\n".join(full_err.strip().splitlines()[-20:]) if full_err else ""
+                update_job(job_id, status="failed", progress_label="Failed", error=f"Slurm: {final_state}\n{err_tail}")
                 return
 
             # Succeeded — copy outputs back
