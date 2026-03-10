@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import shutil
 import sqlite3
@@ -144,6 +145,14 @@ def init_db() -> None:
             )
             """
         )
+        for col, typedef in [
+            ("progress_pct", "INTEGER DEFAULT 0"),
+            ("progress_label", "TEXT DEFAULT ''"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass
         conn.commit()
 
 
@@ -207,11 +216,42 @@ def run_local_cmd(
     return subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True, text=True, capture_output=True)
 
 
+def _ssh_base_opts() -> List[str]:
+    """Common SSH/SCP options: batch mode, auto-accept host keys, timeout, explicit key."""
+    ssh_key = Path.home() / ".ssh" / "id_ed25519"
+    opts = [
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=30",
+    ]
+    if ssh_key.exists():
+        opts += ["-i", str(ssh_key)]
+    return opts
+
+
 def run_ssh_cmd(host: str, user: str, remote_cmd: str) -> subprocess.CompletedProcess:
-    return run_local_cmd(
-        ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", f"{user}@{host}", remote_cmd],
-        cwd=APP_ROOT,
-    )
+    cmd = ["ssh"] + _ssh_base_opts() + [f"{user}@{host}", remote_cmd]
+    try:
+        return run_local_cmd(cmd, cwd=APP_ROOT)
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.strip() if exc.stderr else f"exit status {exc.returncode}"
+        raise subprocess.CalledProcessError(
+            exc.returncode, exc.cmd, output=exc.stdout, stderr=exc.stderr
+        ) from RuntimeError(f"SSH failed: {detail}")
+
+
+def run_scp_cmd(srcs: List[str], dest: str, recursive: bool = False) -> subprocess.CompletedProcess:
+    cmd = ["scp"] + _ssh_base_opts()
+    if recursive:
+        cmd.append("-r")
+    cmd += srcs + [dest]
+    try:
+        return run_local_cmd(cmd, cwd=APP_ROOT)
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.strip() if exc.stderr else f"exit status {exc.returncode}"
+        raise subprocess.CalledProcessError(
+            exc.returncode, exc.cmd, output=exc.stdout, stderr=exc.stderr
+        ) from RuntimeError(f"SCP failed: {detail}")
 
 
 # ---------------------------------------------------------------------------
@@ -290,13 +330,99 @@ def map_slurm_state(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Progress tracking helpers
+# ---------------------------------------------------------------------------
+
+_RE_GCT_ROWS = re.compile(r"\.\.\.\s+([\d,]+)/([\d,]+)\s+rows")
+_RE_PIPELINE_CLUSTER = re.compile(r">>\s+.*leafcutter_cluster")
+_RE_PIPELINE_LC2 = re.compile(r">>\s+.*leafcutter2")
+_RE_PIPELINE_DONE = re.compile(r"^Done\.\s*$", re.MULTILINE)
+
+
+def _read_log_tail(log_path: Path, tail_bytes: int = 8192) -> str:
+    """Read the last tail_bytes of a log file."""
+    if not log_path.exists():
+        return ""
+    try:
+        size = log_path.stat().st_size
+        with open(log_path, "rb") as f:
+            f.seek(max(0, size - tail_bytes))
+            return f.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _gct_row_progress(log_tail: str, pct_min: int, pct_max: int) -> int:
+    """Extract GCT conversion progress from row-count markers in log tail."""
+    matches = list(_RE_GCT_ROWS.finditer(log_tail))
+    if not matches:
+        return pct_min
+    last = matches[-1]
+    current = int(last.group(1).replace(",", ""))
+    total = int(last.group(2).replace(",", ""))
+    if total <= 0:
+        return pct_min
+    frac = min(1.0, current / total)
+    return pct_min + int(frac * (pct_max - pct_min))
+
+
+def _upload_pipeline_progress(log_tail: str) -> tuple:
+    """Progress for upload-source local pipeline (full 10-95 range)."""
+    if _RE_PIPELINE_DONE.search(log_tail):
+        return 95, "Pipeline complete"
+    if _RE_PIPELINE_LC2.search(log_tail):
+        return 70, "Classifying splicing events..."
+    if _RE_PIPELINE_CLUSTER.search(log_tail):
+        return 40, "Clustering junctions..."
+    return 10, "Running pipeline..."
+
+
+def _gtex_pipeline_progress(log_tail: str) -> tuple:
+    """Progress for GTEx-source pipeline phase (60-92 range)."""
+    if _RE_PIPELINE_DONE.search(log_tail):
+        return 92, "Pipeline complete"
+    if _RE_PIPELINE_LC2.search(log_tail):
+        return 80, "Classifying splicing events..."
+    if _RE_PIPELINE_CLUSTER.search(log_tail):
+        return 65, "Clustering junctions..."
+    return 60, "Running pipeline..."
+
+
+def _poll_proc(
+    job_id: str,
+    proc: subprocess.Popen,
+    log_path: Path,
+    default_pct: int,
+    default_label: str,
+    progress_fn=None,
+    interval: float = 3.0,
+) -> int:
+    """Poll subprocess until it exits, updating progress periodically.
+
+    progress_fn(log_tail: str) -> (pct: int, label: str)
+    Returns the subprocess exit code.
+    """
+    update_job(job_id, progress_pct=default_pct, progress_label=default_label)
+    while proc.poll() is None:
+        time.sleep(interval)
+        if progress_fn:
+            try:
+                tail = _read_log_tail(log_path)
+                pct, label = progress_fn(tail)
+                update_job(job_id, progress_pct=pct, progress_label=label)
+            except Exception:
+                pass
+    return proc.returncode
+
+
+# ---------------------------------------------------------------------------
 # Background workers
 # ---------------------------------------------------------------------------
 
 
 def local_worker(job_id: str, cmd: List[str], work_dir: Path) -> None:
     log_file = work_dir / "pipeline.log"
-    update_job(job_id, status="running")
+    update_job(job_id, status="running", progress_pct=5, progress_label="Starting pipeline...")
     try:
         with open(log_file, "w") as log:
             proc = subprocess.Popen(
@@ -304,10 +430,13 @@ def local_worker(job_id: str, cmd: List[str], work_dir: Path) -> None:
             )
             ACTIVE_PROCS[job_id] = proc
             update_job(job_id, runner_ref=str(proc.pid))
-            rc = proc.wait()
+            rc = _poll_proc(
+                job_id, proc, log_file, 10, "Running pipeline...",
+                _upload_pipeline_progress,
+            )
 
         if rc < 0:
-            update_job(job_id, status="cancelled", error=f"Terminated by signal {-rc}")
+            update_job(job_id, status="cancelled", progress_label="Terminated", error=f"Terminated by signal {-rc}")
             return
         if rc != 0:
             tail = ""
@@ -316,7 +445,7 @@ def local_worker(job_id: str, cmd: List[str], work_dir: Path) -> None:
                 tail = "\n".join(lines[-20:])
             except Exception:
                 pass
-            update_job(job_id, status="failed", error=f"Exit code {rc}\n{tail}")
+            update_job(job_id, status="failed", progress_label="Failed", error=f"Exit code {rc}\n{tail}")
             return
 
         summary_path = work_dir / "out" / "summary.json"
@@ -324,11 +453,13 @@ def local_worker(job_id: str, cmd: List[str], work_dir: Path) -> None:
         update_job(
             job_id,
             status="succeeded",
+            progress_pct=100,
+            progress_label="Complete",
             summary_path=str(summary_path) if summary_path.exists() else None,
             artifacts_zip=str(zip_path) if zip_path else None,
         )
     except Exception as exc:
-        update_job(job_id, status="failed", error=f"{type(exc).__name__}: {exc}")
+        update_job(job_id, status="failed", progress_label="Error", error=f"{type(exc).__name__}: {exc}")
     finally:
         ACTIVE_PROCS.pop(job_id, None)
         ACTIVE_WORKERS.pop(job_id, None)
@@ -345,6 +476,7 @@ def slurm_worker(
         job = get_job_or_404(job_id)
         slurm_id = job["quest_job_id"]
         poll_interval = 15
+        update_job(job_id, progress_pct=5, progress_label="Submitted to cluster")
 
         while True:
             try:
@@ -354,7 +486,11 @@ def slurm_worker(
                 sq_state = ""
 
             if sq_state:
-                update_job(job_id, status=map_slurm_state(sq_state))
+                mapped = map_slurm_state(sq_state)
+                if mapped == "running":
+                    update_job(job_id, status="running", progress_pct=30, progress_label="Running on cluster")
+                else:
+                    update_job(job_id, status=mapped, progress_pct=10, progress_label="Queued on cluster")
                 time.sleep(poll_interval)
                 continue
 
@@ -369,20 +505,21 @@ def slurm_worker(
             mapped = map_slurm_state(final_state)
 
             if mapped == "cancelled":
-                update_job(job_id, status="cancelled", error=f"Slurm: {final_state}")
+                update_job(job_id, status="cancelled", progress_label="Cancelled", error=f"Slurm: {final_state}")
                 return
             if mapped != "succeeded":
-                update_job(job_id, status="failed", error=f"Slurm: {final_state}")
+                update_job(job_id, status="failed", progress_label="Failed", error=f"Slurm: {final_state}")
                 return
 
             # Succeeded — copy outputs back
+            update_job(job_id, progress_pct=85, progress_label="Retrieving outputs...")
             local_work = Path(get_job_or_404(job_id)["work_dir"])
             local_out = local_work / "out"
             local_out.mkdir(parents=True, exist_ok=True)
             try:
-                run_local_cmd(["scp", "-r", f"{user}@{host}:{remote_out_dir}/.", str(local_out)])
+                run_scp_cmd([f"{user}@{host}:{remote_out_dir}/."], str(local_out), recursive=True)
             except subprocess.CalledProcessError as e:
-                update_job(job_id, status="failed", error=f"Output retrieval failed: {e}")
+                update_job(job_id, status="failed", progress_label="Output retrieval failed", error=f"Output retrieval failed: {e}")
                 return
 
             summary_path = local_out / "summary.json"
@@ -390,13 +527,15 @@ def slurm_worker(
             update_job(
                 job_id,
                 status="succeeded",
+                progress_pct=100,
+                progress_label="Complete",
                 summary_path=str(summary_path) if summary_path.exists() else None,
                 artifacts_zip=str(zip_path) if zip_path else None,
             )
             return
 
     except Exception as exc:
-        update_job(job_id, status="failed", error=f"{type(exc).__name__}: {exc}")
+        update_job(job_id, status="failed", progress_label="Error", error=f"{type(exc).__name__}: {exc}")
     finally:
         ACTIVE_WORKERS.pop(job_id, None)
 
@@ -404,12 +543,14 @@ def slurm_worker(
 def gtex_local_worker(job_id: str, tissues: str, work_dir: Path, config: Dict[str, Any]) -> None:
     """Background worker: download GTEx GCT, convert to BED, run pipeline."""
     log_file = work_dir / "pipeline.log"
-    update_job(job_id, status="running")
+    update_job(job_id, status="running", progress_pct=2, progress_label="Preparing...")
     try:
         with open(log_file, "w") as log:
             # Phase 1: ensure annotations + GCT are cached
             log.write("[GTEx] Ensuring annotations are cached ...\n")
             log.flush()
+            update_job(job_id, progress_pct=5, progress_label="Downloading annotations...")
+
             def _dl(url: str, dest: Path, label: str) -> bool:
                 if dest.exists():
                     return True
@@ -427,20 +568,23 @@ def gtex_local_worker(job_id: str, tissues: str, work_dir: Path, config: Dict[st
 
             annot_path = GTEX_CACHE / GTEX_ANNOT_FILENAME
             if not _dl(GTEX_ANNOT_URL, annot_path, "annotations"):
-                update_job(job_id, status="failed", error="Annotations download failed")
+                update_job(job_id, status="failed", progress_label="Download failed", error="Annotations download failed")
                 return
 
+            update_job(job_id, progress_pct=10, progress_label="Downloading junction data...")
             gct_path = GTEX_CACHE / GTEX_GCT_FILENAME
             if not gct_path.exists():
                 log.write("[GTEx] This will take a while on the first run (~4 GB) ...\n")
                 log.flush()
             if not _dl(GTEX_GCT_URL, gct_path, "junction GCT"):
                 gct_path.unlink(missing_ok=True)
-                update_job(job_id, status="failed", error="GCT download failed")
+                update_job(job_id, status="failed", progress_label="Download failed", error="GCT download failed")
                 return
             else:
                 log.write("[GTEx] Using cached GCT\n")
                 log.flush()
+
+            update_job(job_id, progress_pct=20, progress_label="Data ready")
 
             # Phase 2: convert GCT -> per-sample BEDs
             bed_dir = work_dir / "junctions_bed"
@@ -453,24 +597,29 @@ def gtex_local_worker(job_id: str, tissues: str, work_dir: Path, config: Dict[st
                 "--annotations", str(annot_path),
                 "--tissues", tissues,
                 "--outdir", str(bed_dir),
+                "--max_samples_per_tissue", str(config.get("max_samples_per_tissue", 0)),
             ]
             proc = subprocess.Popen(
                 convert_cmd, cwd=str(APP_ROOT), stdout=log, stderr=subprocess.STDOUT, text=True,
             )
             ACTIVE_PROCS[job_id] = proc
-            rc = proc.wait()
+            rc = _poll_proc(
+                job_id, proc, log_file, 25, "Converting GCT to BED...",
+                lambda tail: (_gct_row_progress(tail, 25, 55), "Converting GCT to BED..."),
+            )
             if rc != 0:
-                update_job(job_id, status="failed", error=f"GCT-to-BED conversion failed (exit {rc})")
+                update_job(job_id, status="failed", progress_label="Conversion failed", error=f"GCT-to-BED conversion failed (exit {rc})")
                 return
 
             filelist = bed_dir / "junction_files.txt"
             if not filelist.exists():
-                update_job(job_id, status="failed", error="Conversion produced no junction_files.txt")
+                update_job(job_id, status="failed", progress_label="Conversion failed", error="Conversion produced no junction_files.txt")
                 return
 
             bed_files = [l.strip() for l in filelist.read_text().splitlines() if l.strip()]
             log.write(f"[GTEx] Conversion done: {len(bed_files)} BED files\n")
             log.flush()
+            update_job(job_id, progress_pct=55, progress_label="Conversion complete")
 
             # Phase 3: run the LeafCutter2 pipeline using --junction_beds
             pipeline_cmd = [
@@ -494,7 +643,10 @@ def gtex_local_worker(job_id: str, tissues: str, work_dir: Path, config: Dict[st
             )
             ACTIVE_PROCS[job_id] = proc
             update_job(job_id, runner_ref=str(proc.pid))
-            rc = proc.wait()
+            rc = _poll_proc(
+                job_id, proc, log_file, 60, "Starting pipeline...",
+                _gtex_pipeline_progress,
+            )
 
         if rc != 0:
             tail = ""
@@ -503,19 +655,22 @@ def gtex_local_worker(job_id: str, tissues: str, work_dir: Path, config: Dict[st
                 tail = "\n".join(lines[-20:])
             except Exception:
                 pass
-            update_job(job_id, status="failed", error=f"Pipeline failed (exit {rc})\n{tail}")
+            update_job(job_id, status="failed", progress_label="Pipeline failed", error=f"Pipeline failed (exit {rc})\n{tail}")
             return
 
+        update_job(job_id, progress_pct=95, progress_label="Packaging outputs...")
         summary_path = work_dir / "out" / "summary.json"
         zip_path = package_outputs(job_id, work_dir)
         update_job(
             job_id,
             status="succeeded",
+            progress_pct=100,
+            progress_label="Complete",
             summary_path=str(summary_path) if summary_path.exists() else None,
             artifacts_zip=str(zip_path) if zip_path else None,
         )
     except Exception as exc:
-        update_job(job_id, status="failed", error=f"{type(exc).__name__}: {exc}")
+        update_job(job_id, status="failed", progress_label="Error", error=f"{type(exc).__name__}: {exc}")
     finally:
         ACTIVE_PROCS.pop(job_id, None)
         ACTIVE_WORKERS.pop(job_id, None)
@@ -609,6 +764,7 @@ async def create_job(
     remote_repo_root: str = Form(""),
     remote_work_root: str = Form("~/leafcutter_jobs"),
     remote_juncfiles: str = Form(""),
+    max_samples_per_tissue: int = Form(0),
 ) -> JSONResponse:
     mode = mode.strip().lower()
     if mode not in {"local", "slurm"}:
@@ -645,6 +801,7 @@ async def create_job(
         "quest_partition": quest_partition,
         "remote_repo_root": remote_repo_root,
         "remote_work_root": remote_work_root,
+        "max_samples_per_tissue": max_samples_per_tissue,
     }
     source = source.strip().lower()
     gtex_tissues_list = [t.strip() for t in gtex_tissues_csv.split(",") if t.strip()]
@@ -723,12 +880,21 @@ async def create_job(
         raise HTTPException(status_code=400, detail=msg)
 
     try:
+        # Resolve ~ to absolute home path on the remote host so that
+        # SBATCH directives (which don't expand ~) and double-quoted
+        # shell strings all work correctly.
+        if remote_work_root.startswith("~"):
+            home_result = run_ssh_cmd(quest_host, quest_user, "echo $HOME")
+            remote_home = home_result.stdout.strip()
+            remote_work_root = remote_work_root.replace("~", remote_home, 1)
+
         remote_run_dir = f"{remote_work_root.rstrip('/')}/{job_id}"
         run_ssh_cmd(quest_host, quest_user, f"mkdir -p {remote_run_dir}/inputs")
 
         rr = remote_repo_root.rstrip("/")
         sbatch_preamble = [
             "#!/bin/bash",
+            "set -eo pipefail",
             f"#SBATCH --account={quest_account}",
             f"#SBATCH --partition={quest_partition}",
             "#SBATCH --time=48:00:00",
@@ -740,8 +906,8 @@ async def create_job(
             f"#SBATCH --error={remote_run_dir}/slurm_%j.err",
             "",
             f"cd {rr}",
-            "module purge all",
-            "module load python/3.11.5",
+            "module purge",
+            "module load anaconda3/2022.05",
             "",
         ]
 
@@ -751,6 +917,7 @@ async def create_job(
             tissues_escaped = ",".join(gtex_tissues_list)
             gtex_cache_remote = f"{remote_run_dir}/gtex_cache"
             bed_dir_remote = f"{remote_run_dir}/junctions_bed"
+            max_spt = config.get("max_samples_per_tissue", 0)
             sbatch_body = "\n".join(sbatch_preamble + [
                 f"mkdir -p {gtex_cache_remote}",
                 "",
@@ -766,6 +933,7 @@ async def create_job(
                     f' --annotations "$ANNOT"'
                     f' --tissues "{tissues_escaped}"'
                     f' --outdir {bed_dir_remote}'
+                    f' --max_samples_per_tissue {max_spt}'
                 ),
                 "",
                 (
@@ -790,12 +958,12 @@ async def create_job(
                 remote_lines: List[str] = []
                 for p in local_sj_files:
                     rpath = f"{remote_run_dir}/inputs/{p.name}"
-                    run_local_cmd(["scp", str(p), f"{quest_user}@{quest_host}:{rpath}"])
+                    run_scp_cmd([str(p)], f"{quest_user}@{quest_host}:{rpath}")
                     remote_lines.append(rpath)
                 local_list = work_dir / "remote_junction_files.txt"
                 local_list.write_text("\n".join(remote_lines) + "\n")
                 remote_junc_list = f"{remote_run_dir}/inputs/junction_files.txt"
-                run_local_cmd(["scp", str(local_list), f"{quest_user}@{quest_host}:{remote_junc_list}"])
+                run_scp_cmd([str(local_list)], f"{quest_user}@{quest_host}:{remote_junc_list}")
 
             sbatch_body = "\n".join(sbatch_preamble + [
                 (
@@ -815,7 +983,7 @@ async def create_job(
         slurm_script = work_dir / "job.sbatch"
         slurm_script.write_text(sbatch_body)
         remote_script = f"{remote_run_dir}/job.sbatch"
-        run_local_cmd(["scp", str(slurm_script), f"{quest_user}@{quest_host}:{remote_script}"])
+        run_scp_cmd([str(slurm_script)], f"{quest_user}@{quest_host}:{remote_script}")
 
         submit = run_ssh_cmd(quest_host, quest_user, f"sbatch --parsable {remote_script}")
         quest_job_id = submit.stdout.strip().split(";")[0]
@@ -837,6 +1005,10 @@ async def create_job(
 
     except HTTPException:
         raise
+    except subprocess.CalledProcessError as exc:
+        ssh_err = exc.stderr.strip() if exc.stderr else str(exc)
+        update_job(job_id, status="failed", error=f"SSH/SCP error: {ssh_err}")
+        raise HTTPException(status_code=500, detail=f"Slurm submission failed: {ssh_err}")
     except Exception as exc:
         update_job(job_id, status="failed", error=f"{type(exc).__name__}: {exc}")
         raise HTTPException(status_code=500, detail=f"Slurm submission failed: {exc}")
@@ -898,6 +1070,40 @@ def get_job_results(job_id: str) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# GET /jobs/{id}/logs — incremental log streaming
+# ---------------------------------------------------------------------------
+
+
+@app.get("/jobs/{job_id}/logs")
+def get_job_logs(job_id: str, offset: int = 0, limit: int = 65536) -> JSONResponse:
+    job = get_job_or_404(job_id)
+    log_path = Path(job["work_dir"]) / "pipeline.log"
+    terminal = job["status"] in {"succeeded", "failed", "cancelled"}
+
+    if not log_path.exists():
+        return JSONResponse({"lines": [], "next_offset": 0, "eof": terminal})
+
+    try:
+        size = log_path.stat().st_size
+    except OSError:
+        return JSONResponse({"lines": [], "next_offset": offset, "eof": True})
+
+    if offset >= size:
+        return JSONResponse({"lines": [], "next_offset": offset, "eof": terminal})
+
+    with open(log_path, "rb") as f:
+        f.seek(offset)
+        raw = f.read(limit)
+
+    new_offset = offset + len(raw)
+    text = raw.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    eof = new_offset >= size and terminal
+
+    return JSONResponse({"lines": lines, "next_offset": new_offset, "eof": eof})
+
+
+# ---------------------------------------------------------------------------
 # GET /jobs/{id}/download
 # ---------------------------------------------------------------------------
 
@@ -909,6 +1115,34 @@ def download_artifacts(job_id: str) -> FileResponse:
     if not zp or not Path(zp).exists():
         raise HTTPException(status_code=404, detail="Artifacts not available yet.")
     return FileResponse(path=zp, filename=f"{job_id}_artifacts.zip", media_type="application/zip")
+
+
+# ---------------------------------------------------------------------------
+# GET /jobs/{id}/artifacts/{filename} — single artifact download
+# ---------------------------------------------------------------------------
+
+_ARTIFACT_MIME = {
+    ".png": "image/png",
+    ".tsv": "text/tab-separated-values",
+    ".json": "application/json",
+    ".txt": "text/plain",
+    ".gz": "application/gzip",
+}
+
+
+@app.get("/jobs/{job_id}/artifacts/{filename}")
+def download_single_artifact(job_id: str, filename: str) -> FileResponse:
+    job = get_job_or_404(job_id)
+    safe_name = Path(filename).name
+    if safe_name != filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    artifact = Path(job["work_dir"]) / "out" / safe_name
+    if not artifact.exists():
+        raise HTTPException(status_code=404, detail=f"Artifact '{safe_name}' not found")
+
+    mime = _ARTIFACT_MIME.get(artifact.suffix, "application/octet-stream")
+    return FileResponse(path=str(artifact), filename=safe_name, media_type=mime)
 
 
 # ---------------------------------------------------------------------------
@@ -955,3 +1189,89 @@ def cancel_job(job_id: str) -> JSONResponse:
             pass
     update_job(job_id, status="cancelled", error="Cancelled by user")
     return JSONResponse({"job_id": job_id, "status": "cancelled", "quest_job_id": slurm_id})
+
+
+# ---------------------------------------------------------------------------
+# DELETE /jobs/{id} — delete a single job (files + DB row)
+# ---------------------------------------------------------------------------
+
+
+def _delete_job_impl(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Shared logic: cancel if active, remove local/remote files, delete DB row."""
+    job_id = job["id"]
+    result: Dict[str, Any] = {"job_id": job_id, "local_cleaned": False, "remote_cleaned": False}
+
+    # Cancel if still active
+    if job["status"] in ACTIVE:
+        if job["mode"] == "local":
+            proc = ACTIVE_PROCS.get(job_id)
+            if proc and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            ACTIVE_PROCS.pop(job_id, None)
+        else:
+            cfg = job.get("config_payload", {})
+            slurm_id = job.get("quest_job_id")
+            host = cfg.get("quest_host", "login.quest.northwestern.edu")
+            user = cfg.get("quest_user")
+            if slurm_id and user:
+                try:
+                    run_ssh_cmd(host, user, f"scancel {slurm_id}")
+                except Exception:
+                    pass
+        ACTIVE_WORKERS.pop(job_id, None)
+
+    # Remove local work directory
+    work_dir = Path(job["work_dir"])
+    if work_dir.exists():
+        shutil.rmtree(work_dir, ignore_errors=True)
+        result["local_cleaned"] = True
+
+    # Remove remote job directory (best-effort)
+    if job["mode"] == "slurm":
+        cfg = job.get("config_payload", {})
+        host = cfg.get("quest_host", "login.quest.northwestern.edu")
+        user = cfg.get("quest_user")
+        remote_work_root = cfg.get("remote_work_root", "")
+        if user and remote_work_root:
+            remote_dir = f"{remote_work_root.rstrip('/')}/{job_id}"
+            try:
+                run_ssh_cmd(host, user, f"rm -rf {remote_dir}")
+                result["remote_cleaned"] = True
+            except Exception:
+                pass
+
+    # Delete DB row
+    db_execute("DELETE FROM jobs WHERE id=?", (job_id,))
+    return result
+
+
+ACTIVE = {"queued", "submitted", "running"}
+
+
+@app.delete("/jobs/{job_id}")
+def delete_job(job_id: str) -> JSONResponse:
+    job = get_job_or_404(job_id)
+    result = _delete_job_impl(job)
+    return JSONResponse(result)
+
+
+# ---------------------------------------------------------------------------
+# DELETE /jobs — delete all jobs
+# ---------------------------------------------------------------------------
+
+
+@app.delete("/jobs")
+def delete_all_jobs() -> JSONResponse:
+    rows = db_fetch_all("SELECT * FROM jobs")
+    deleted = 0
+    for row in rows:
+        try:
+            _delete_job_impl(_row_to_dict(row))
+            deleted += 1
+        except Exception:
+            pass
+    return JSONResponse({"deleted": deleted, "total": len(rows)})

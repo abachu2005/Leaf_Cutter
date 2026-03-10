@@ -59,6 +59,11 @@
   .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
   .tab-content { display: none; }
   .tab-content.active { display: block; }
+  .progress-container { margin-top: 12px; }
+  .progress-bar-track { width: 100%; height: 22px; background: #e9ecef; border-radius: 4px; overflow: hidden; position: relative; }
+  .progress-bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), #3d8bfd); transition: width 0.6s ease; border-radius: 4px; min-width: 0; }
+  .progress-bar-text { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 0.75rem; font-weight: 600; color: var(--text); pointer-events: none; }
+  .progress-label { font-size: 0.82rem; color: var(--muted); margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -104,6 +109,9 @@
         <button type="button" id="tissue-deselect-all">Deselect All</button>
       </div>
       <div class="tissue-count" id="tissue-count">Loading tissue list...</div>
+      <label for="max_samples_per_tissue">Max Samples per Tissue</label>
+      <input id="max_samples_per_tissue" name="max_samples_per_tissue" type="number" value="0" min="0" placeholder="0 = all samples" />
+      <p class="hint">Limit the number of samples used per tissue. Set to 0 to use all available samples. A value like 50–100 is useful for quick test runs.</p>
     </div>
 
     <div class="card">
@@ -166,6 +174,13 @@
       <code id="job-id-display" style="font-size:0.85rem;color:var(--muted);"></code>
     </div>
     <div class="meta-row" id="meta-row"></div>
+    <div class="progress-container hidden" id="progress-container">
+      <div class="progress-bar-track">
+        <div class="progress-bar-fill" id="progress-fill" style="width:0%"></div>
+        <div class="progress-bar-text" id="progress-text"></div>
+      </div>
+      <div class="progress-label" id="progress-label"></div>
+    </div>
     <div id="error-box" class="error-box hidden"></div>
     <div class="actions">
       <button class="btn btn-danger btn-sm hidden" id="cancel-btn">Cancel Job</button>
@@ -178,10 +193,28 @@
     <h2>Results</h2>
     <div class="tabs">
       <div class="tab active" data-tab="summary-tab">Summary</div>
+      <div class="tab" data-tab="tissue-tab">Tissue Chart</div>
       <div class="tab" data-tab="log-tab">Pipeline Log</div>
     </div>
     <div id="summary-tab" class="tab-content active">
       <pre id="summary-json">Waiting for results...</pre>
+    </div>
+    <div id="tissue-tab" class="tab-content">
+      <div id="tissue-chart-container">
+        <p id="tissue-chart-placeholder" style="color:var(--muted); font-size:0.9rem;">
+          No tissue chart available for this run.
+        </p>
+        <div id="tissue-chart-content" class="hidden">
+          <div id="tissue-stats" style="display:flex; gap:18px; flex-wrap:wrap; margin-bottom:12px; font-size:0.88rem;"></div>
+          <div style="text-align:center;">
+            <img id="tissue-chart-img" style="max-width:100%; border:1px solid var(--border); border-radius:4px;" alt="Unproductive by tissue" />
+          </div>
+          <div style="display:flex; gap:8px; margin-top:12px;">
+            <button class="btn btn-success btn-sm" id="tissue-dl-png">Download PNG</button>
+            <button class="btn btn-sm" id="tissue-dl-tsv" style="background:#6c757d; color:#fff;">Download TSV</button>
+          </div>
+        </div>
+      </div>
     </div>
     <div id="log-tab" class="tab-content">
       <pre id="log-content">No log available yet.</pre>
@@ -190,7 +223,10 @@
 
   <!-- PREVIOUS JOBS -->
   <div class="card">
-    <h2>Recent Jobs</h2>
+    <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border); padding-bottom:8px; margin-bottom:12px;">
+      <h2 style="margin:0; border:none; padding:0;">Recent Jobs</h2>
+      <button class="btn btn-danger btn-sm" id="clear-all-btn">Clear All Jobs</button>
+    </div>
     <div id="jobs-list" style="font-size:0.85rem; color:var(--muted);">Loading...</div>
   </div>
 </div>
@@ -215,9 +251,21 @@ const uploadCard = $("#upload-card");
 const gtexCard = $("#gtex-card");
 const tissueSelect = $("#gtex-tissue-select");
 const tissueCount = $("#tissue-count");
+const progressContainer = $("#progress-container");
+const progressFill = $("#progress-fill");
+const progressText = $("#progress-text");
+const progressLabel = $("#progress-label");
+const tissueChartPlaceholder = $("#tissue-chart-placeholder");
+const tissueChartContent = $("#tissue-chart-content");
+const tissueChartImg = $("#tissue-chart-img");
+const tissueStats = $("#tissue-stats");
+const tissueDlPng = $("#tissue-dl-png");
+const tissueDlTsv = $("#tissue-dl-tsv");
 
 let currentJobId = null;
 let pollTimer = null;
+let logOffset = 0;
+let logTimer = null;
 
 function getSource() {
   const checked = document.querySelector('input[name="source"]:checked');
@@ -234,14 +282,12 @@ document.querySelectorAll('input[name="source"]').forEach(r =>
 );
 updateSourceUI();
 
-// Toggle slurm fields visibility
 function updateModeUI() {
   slurmCard.style.display = modeSelect.value === "slurm" ? "block" : "none";
 }
 modeSelect.addEventListener("change", updateModeUI);
 updateModeUI();
 
-// GTEx tissue list
 async function loadTissues() {
   try {
     const r = await fetch("/gtex/tissues");
@@ -268,7 +314,6 @@ $("#tissue-deselect-all").addEventListener("click", () => {
   Array.from(tissueSelect.options).forEach(o => o.selected = false);
 });
 
-// Tabs
 document.querySelectorAll(".tab").forEach(tab => {
   tab.addEventListener("click", () => {
     document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
@@ -278,7 +323,16 @@ document.querySelectorAll(".tab").forEach(tab => {
   });
 });
 
-function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+// --- Polling controls ---
+
+function stopLogPolling() {
+  if (logTimer) { clearInterval(logTimer); logTimer = null; }
+}
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  stopLogPolling();
+}
 
 function setBadge(status) {
   badge.textContent = status;
@@ -290,8 +344,43 @@ function showError(msg) {
   else { errorBox.classList.add("hidden"); }
 }
 
+function setProgress(pct, label) {
+  progressContainer.classList.remove("hidden");
+  progressFill.style.width = pct + "%";
+  progressText.textContent = pct > 0 ? pct + "%" : "";
+  progressLabel.textContent = label || "";
+}
+
 const TERMINAL = new Set(["succeeded", "failed", "cancelled"]);
 const ACTIVE = new Set(["queued", "submitted", "running"]);
+
+// --- Live log polling ---
+
+async function pollLogs() {
+  if (!currentJobId) return;
+  try {
+    const r = await fetch(`/jobs/${currentJobId}/logs?offset=${logOffset}`);
+    const d = await r.json();
+    if (d.lines && d.lines.length) {
+      const atBottom = logContent.scrollHeight - logContent.scrollTop - logContent.clientHeight < 60;
+      if (logContent.textContent === "No log available yet.") {
+        logContent.textContent = "";
+      }
+      logContent.textContent += d.lines.join("\n") + "\n";
+      logOffset = d.next_offset;
+      if (atBottom) logContent.scrollTop = logContent.scrollHeight;
+    }
+    if (d.eof) stopLogPolling();
+  } catch (_) {}
+}
+
+function startLogPolling() {
+  if (logTimer) return;
+  pollLogs();
+  logTimer = setInterval(pollLogs, 2000);
+}
+
+// --- Summary fetch (terminal states) ---
 
 async function fetchResults() {
   if (!currentJobId) return;
@@ -300,12 +389,39 @@ async function fetchResults() {
     const d = await r.json();
     if (d.summary) {
       summaryJson.textContent = JSON.stringify(d.summary, null, 2);
+      renderTissueChart(d.summary);
     }
-    if (d.log_tail && d.log_tail.length) {
+    if (d.log_tail && d.log_tail.length && logContent.textContent === "No log available yet.") {
       logContent.textContent = d.log_tail.join("\n");
     }
   } catch (_) {}
 }
+
+function renderTissueChart(summary) {
+  const m = summary && summary.metrics && summary.metrics.unproductive_by_tissue;
+  if (!m || !m.png) {
+    tissueChartPlaceholder.classList.remove("hidden");
+    tissueChartContent.classList.add("hidden");
+    return;
+  }
+  tissueChartPlaceholder.classList.add("hidden");
+  tissueChartContent.classList.remove("hidden");
+
+  const imgUrl = `/jobs/${currentJobId}/artifacts/${m.png}`;
+  tissueChartImg.src = imgUrl;
+
+  const stats = [];
+  if (m.n_tissues != null) stats.push(`<span><strong>Tissues:</strong> ${m.n_tissues}</span>`);
+  if (m.n_samples != null) stats.push(`<span><strong>Samples:</strong> ${m.n_samples}</span>`);
+  if (m.global_weighted_mean_pct != null) stats.push(`<span><strong>Weighted mean:</strong> ${m.global_weighted_mean_pct.toFixed(3)}%</span>`);
+  if (m.global_median_pct != null) stats.push(`<span><strong>Median:</strong> ${m.global_median_pct.toFixed(3)}%</span>`);
+  tissueStats.innerHTML = stats.join("");
+
+  tissueDlPng.onclick = () => { window.location.href = `/jobs/${currentJobId}/artifacts/${m.png}`; };
+  tissueDlTsv.onclick = () => { window.location.href = `/jobs/${currentJobId}/artifacts/${m.tsv}`; };
+}
+
+// --- Job status polling ---
 
 async function pollJob() {
   if (!currentJobId) return;
@@ -323,10 +439,19 @@ async function pollJob() {
     metaRow.innerHTML = meta.join("");
 
     showError(d.error);
+    setProgress(d.progress_pct || 0, d.progress_label || "");
 
     if (ACTIVE.has(d.status)) {
       cancelBtn.classList.remove("hidden");
       downloadBtn.classList.add("hidden");
+      if (resultsPanel.classList.contains("hidden")) {
+        resultsPanel.classList.remove("hidden");
+        document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+        document.querySelectorAll(".tab-content").forEach(tc => tc.classList.remove("active"));
+        document.querySelector('[data-tab="log-tab"]').classList.add("active");
+        document.getElementById("log-tab").classList.add("active");
+      }
+      startLogPolling();
     } else {
       cancelBtn.classList.add("hidden");
     }
@@ -342,6 +467,7 @@ async function pollJob() {
     }
 
     if (TERMINAL.has(d.status)) {
+      pollLogs();
       stopPolling();
       submitBtn.disabled = false;
     }
@@ -350,7 +476,8 @@ async function pollJob() {
   }
 }
 
-// Submit
+// --- Submit ---
+
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
   stopPolling();
@@ -369,13 +496,24 @@ form.addEventListener("submit", async (e) => {
     fd.set("gtex_tissues_csv", selected.join(","));
   }
 
+  // Reset UI state
+  logOffset = 0;
+  stopLogPolling();
   jobPanel.classList.remove("hidden");
   resultsPanel.classList.add("hidden");
   downloadBtn.classList.add("hidden");
   cancelBtn.classList.add("hidden");
   errorBox.classList.add("hidden");
+  progressContainer.classList.add("hidden");
+  progressFill.style.width = "0%";
+  progressText.textContent = "";
+  progressLabel.textContent = "";
   summaryJson.textContent = "Waiting for results...";
   logContent.textContent = "No log available yet.";
+  tissueChartPlaceholder.classList.remove("hidden");
+  tissueChartContent.classList.add("hidden");
+  tissueChartImg.src = "";
+  tissueStats.innerHTML = "";
   setBadge("queued");
 
   try {
@@ -390,7 +528,7 @@ form.addEventListener("submit", async (e) => {
     currentJobId = d.job_id;
     jobIdDisplay.textContent = d.job_id;
     setBadge(d.status);
-    pollTimer = setInterval(pollJob, 4000);
+    pollTimer = setInterval(pollJob, 3000);
     pollJob();
   } catch (err) {
     showError("Network error: " + err.message);
@@ -399,7 +537,8 @@ form.addEventListener("submit", async (e) => {
   }
 });
 
-// Cancel
+// --- Cancel / Download ---
+
 cancelBtn.addEventListener("click", async () => {
   if (!currentJobId) return;
   cancelBtn.disabled = true;
@@ -410,12 +549,12 @@ cancelBtn.addEventListener("click", async () => {
   cancelBtn.disabled = false;
 });
 
-// Download
 downloadBtn.addEventListener("click", () => {
   if (currentJobId) window.location.href = `/jobs/${currentJobId}/download`;
 });
 
-// Recent jobs list
+// --- Recent jobs list ---
+
 async function loadJobsList() {
   const el = $("#jobs-list");
   try {
@@ -426,12 +565,42 @@ async function loadJobsList() {
       const d = new Date(j.created_at).toLocaleString();
       return `<div style="padding:4px 0; border-bottom:1px solid #eee; display:flex; justify-content:space-between; align-items:center;">
         <span><code style="font-size:0.8rem;">${j.id.substring(0,8)}...</code> &middot; ${j.mode} &middot; ${d}</span>
-        <span class="status-badge status-${j.status}" style="font-size:0.7rem;">${j.status}</span>
+        <span style="display:flex; align-items:center; gap:8px;">
+          <span class="status-badge status-${j.status}" style="font-size:0.7rem;">${j.status}</span>
+          <button class="btn btn-danger btn-sm job-delete-btn" data-id="${j.id}" style="padding:2px 8px; font-size:0.75rem; line-height:1.2;">&times;</button>
+        </span>
       </div>`;
     }).join("");
+    el.querySelectorAll(".job-delete-btn").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        if (!confirm("Delete this job and its data?")) return;
+        btn.disabled = true;
+        try {
+          await fetch(`/jobs/${btn.dataset.id}`, { method: "DELETE" });
+        } catch (_) {}
+        loadJobsList();
+      });
+    });
   } catch (_) { el.textContent = "Could not load jobs."; }
 }
 loadJobsList();
+
+$("#clear-all-btn").addEventListener("click", async () => {
+  if (!confirm("Delete ALL jobs and their data (local + remote)?")) return;
+  const btn = $("#clear-all-btn");
+  btn.disabled = true;
+  btn.textContent = "Clearing...";
+  try {
+    const r = await fetch("/jobs", { method: "DELETE" });
+    const d = await r.json();
+    btn.textContent = `Cleared ${d.deleted} job(s)`;
+    setTimeout(() => { btn.textContent = "Clear All Jobs"; btn.disabled = false; }, 2000);
+  } catch (_) {
+    btn.textContent = "Error";
+    setTimeout(() => { btn.textContent = "Clear All Jobs"; btn.disabled = false; }, 2000);
+  }
+  loadJobsList();
+});
 </script>
 </body>
 </html>

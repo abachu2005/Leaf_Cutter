@@ -5,11 +5,13 @@ LeafCutter2 end-to-end pipeline (Python-only launcher)
 - No bash scripting required
 """
 
-import argparse, os, sys, shutil, subprocess, json
+import argparse, gzip, os, sys, shutil, subprocess, json
 from pathlib import Path
-from typing import List, Dict
+from typing import Dict, List, Optional
+from collections import defaultdict
 from glob import glob
 
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
@@ -164,6 +166,271 @@ def leafcutter2_classify(
 # Defaults + parser (Option 1)
 # ---------------------------
 
+VALID_CLASSIFICATIONS = {"UP", "PR", "NE", "IN"}
+
+
+def _bed_path_to_col_name(bed_path: str) -> str:
+    """Replicate the column-naming logic from leafcutter_cluster_regtools.py."""
+    return Path(bed_path).name.split(".junc")[0]
+
+
+def _resolve_tissue_labels(
+    sample_cols: List[str],
+    junction_filelist_path: Path,
+    samples_tsv_path: Optional[Path] = None,
+) -> List[str]:
+    """Map junction_counts column names to tissue/group labels.
+
+    Strategy (in priority order):
+      1. BED parent directory names from the junction filelist (GTEx-style).
+      2. ``condition`` column from samples_tsv (non-GTEx with metadata).
+      3. Use each sample name as its own group (fallback).
+    """
+    col_to_tissue: Dict[str, str] = {}
+
+    if junction_filelist_path.exists():
+        bed_paths = [
+            l.strip()
+            for l in junction_filelist_path.read_text().splitlines()
+            if l.strip()
+        ]
+        for bp in bed_paths:
+            p = Path(bp)
+            tissue = p.parent.name
+            col_name = _bed_path_to_col_name(bp)
+            col_to_tissue[col_name] = tissue
+            col_to_tissue[p.name] = tissue
+            col_to_tissue[p.stem] = tissue
+
+    tissues = [col_to_tissue.get(c, col_to_tissue.get(Path(c).name, None)) for c in sample_cols]
+
+    unique = set(t for t in tissues if t is not None)
+    all_resolved = all(t is not None for t in tissues)
+    single_group = len(unique) <= 1
+
+    if (not all_resolved or single_group) and samples_tsv_path and samples_tsv_path.exists():
+        meta = pd.read_csv(samples_tsv_path, sep="\t", dtype=str)
+        if {"sample", "condition"}.issubset(meta.columns):
+            cond_map: Dict[str, str] = {}
+            for _, row in meta.iterrows():
+                s = str(row["sample"])
+                c = str(row["condition"])
+                cond_map[s] = c
+                cond_map[Path(s).name] = c
+                cond_map[Path(s).stem] = c
+                for suf in [".juncs.bed", ".juncs", ".bed", ".sorted.gz"]:
+                    if s.endswith(suf):
+                        cond_map[s[: -len(suf)]] = c
+            tissues = [
+                cond_map.get(c, cond_map.get(Path(c).name, cond_map.get(Path(c).stem, c)))
+                for c in sample_cols
+            ]
+            return tissues
+
+    return [t if t is not None else c for t, c in zip(tissues, sample_cols)]
+
+
+def compute_unproductive_by_tissue(
+    junction_counts_path: Path,
+    junction_filelist_path: Path,
+    outdir: Path,
+    samples_tsv_path: Optional[Path] = None,
+) -> Optional[Dict]:
+    """Compute per-tissue unproductive junction read percentages and generate
+    a bar-chart PNG, a TSV, and a JSON summary.
+
+    Uses the LC2 classification labels (UP/PR/NE/IN) embedded in
+    ``junction_counts.gz`` junction IDs.  Returns metadata dict for
+    inclusion in ``summary.json``, or ``None`` on failure.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[WARN] matplotlib not available — skipping unproductive-by-tissue plot")
+        return None
+
+    if not junction_counts_path.exists():
+        print(f"[WARN] junction_counts not found at {junction_counts_path}")
+        return None
+
+    # ---- 1. Parse junction_counts.gz ----
+    with gzip.open(str(junction_counts_path), "rt") as f:
+        header_tokens = f.readline().strip().split()
+        sample_cols = header_tokens[1:]
+        n = len(sample_cols)
+        if n == 0:
+            return None
+
+        total_reads = np.zeros(n, dtype=np.float64)
+        up_reads = np.zeros(n, dtype=np.float64)
+        has_classification = False
+
+        for line in f:
+            fields = line.strip().split()
+            if len(fields) < 2:
+                continue
+            junc_id = fields[0]
+            reads = np.array([float(x) for x in fields[1 : n + 1]])
+
+            label = junc_id.rsplit(":", 1)[-1]
+            if label in VALID_CLASSIFICATIONS:
+                has_classification = True
+            total_reads += reads
+            if label == "UP":
+                up_reads += reads
+
+    if not has_classification:
+        print("[WARN] junction_counts has no UP/PR/NE/IN labels — classification may not have run")
+        return None
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pct_per_sample = np.where(
+            total_reads > 0, up_reads / total_reads * 100.0, np.nan
+        )
+
+    # ---- 2. Resolve tissue labels ----
+    tissues = _resolve_tissue_labels(
+        sample_cols, junction_filelist_path, samples_tsv_path
+    )
+
+    # ---- 3. Aggregate by tissue ----
+    tissue_samples: Dict[str, List[float]] = defaultdict(list)
+    for i, tissue in enumerate(tissues):
+        if not np.isnan(pct_per_sample[i]):
+            tissue_samples[tissue].append(pct_per_sample[i])
+
+    if not tissue_samples:
+        return None
+
+    rows = []
+    for tissue in sorted(tissue_samples):
+        vals = np.array(tissue_samples[tissue])
+        idxs = [i for i, t in enumerate(tissues) if t == tissue]
+        rows.append(
+            {
+                "tissue": tissue,
+                "n_samples": len(vals),
+                "mean_pct": round(float(np.mean(vals)), 4),
+                "median_pct": round(float(np.median(vals)), 4),
+                "std_pct": round(float(np.std(vals, ddof=1)), 4) if len(vals) > 1 else 0.0,
+                "total_reads": int(sum(total_reads[i] for i in idxs)),
+                "unproductive_reads": int(sum(up_reads[i] for i in idxs)),
+            }
+        )
+
+    result_df = pd.DataFrame(rows).sort_values("mean_pct").reset_index(drop=True)
+
+    # Global statistics
+    all_pcts = np.array([v for vs in tissue_samples.values() for v in vs])
+    global_weighted_mean = float(np.sum(up_reads[~np.isnan(pct_per_sample)]) /
+                                 np.sum(total_reads[~np.isnan(pct_per_sample)]) * 100.0)
+    global_median = float(np.median(all_pcts))
+    n_tissues = len(tissue_samples)
+
+    # ---- 4. Write TSV ----
+    tsv_path = outdir / "unproductive_by_tissue.tsv"
+    result_df.to_csv(tsv_path, sep="\t", index=False)
+
+    # ---- 5. Write JSON ----
+    json_path = outdir / "unproductive_by_tissue.json"
+    json_payload = {
+        "n_tissues": n_tissues,
+        "n_samples": int(np.sum(~np.isnan(pct_per_sample))),
+        "global_weighted_mean_pct": round(global_weighted_mean, 4),
+        "global_median_pct": round(global_median, 4),
+        "tissues": rows,
+    }
+    with open(json_path, "w") as fh:
+        json.dump(json_payload, fh, indent=2)
+
+    # ---- 6. Plot ----
+    png_path = outdir / "unproductive_by_tissue.png"
+    _plot_unproductive_chart(result_df, tissue_samples, global_weighted_mean, png_path)
+
+    print(f"[TISSUE] {n_tissues} tissues, weighted mean = {global_weighted_mean:.3f}%")
+    print(f"[TISSUE] TSV:  {tsv_path}")
+    print(f"[TISSUE] PNG:  {png_path}")
+    print(f"[TISSUE] JSON: {json_path}")
+
+    return {
+        "png": "unproductive_by_tissue.png",
+        "tsv": "unproductive_by_tissue.tsv",
+        "json": "unproductive_by_tissue.json",
+        "n_tissues": n_tissues,
+        "n_samples": int(np.sum(~np.isnan(pct_per_sample))),
+        "global_weighted_mean_pct": round(global_weighted_mean, 4),
+        "global_median_pct": round(global_median, 4),
+    }
+
+
+def _plot_unproductive_chart(
+    result_df: pd.DataFrame,
+    tissue_samples: Dict[str, List[float]],
+    global_mean: float,
+    out_path: Path,
+) -> None:
+    """Render a sorted bar chart of per-tissue unproductive junction read %."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    n = len(result_df)
+    fig_width = max(8, n * 0.45 + 2)
+    fig_height = max(5, 4.5)
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=150)
+
+    x = np.arange(n)
+    cmap = plt.get_cmap("tab20" if n <= 20 else "gist_rainbow")
+    colors = [cmap(i / max(n - 1, 1)) for i in range(n)]
+
+    means = result_df["mean_pct"].values
+    stds = result_df["std_pct"].values
+    labels = result_df["tissue"].values
+
+    ax.bar(x, means, yerr=stds, capsize=3, color=colors, edgecolor="white",
+           linewidth=0.5, alpha=0.85, zorder=2)
+
+    for i, tissue in enumerate(labels):
+        vals = tissue_samples.get(tissue, [])
+        if vals and len(vals) > 1:
+            jitter = np.random.default_rng(42).uniform(-0.25, 0.25, size=len(vals))
+            ax.scatter(
+                np.full(len(vals), i) + jitter,
+                vals,
+                s=10, alpha=0.5, color="black", zorder=3, linewidths=0,
+            )
+
+    ax.axhline(global_mean, color="grey", linestyle="--", linewidth=0.8, alpha=0.7, zorder=1)
+    ax.text(
+        n - 0.5, global_mean, f"  mean = {global_mean:.2f}%",
+        va="bottom", ha="right", fontsize=7, color="grey",
+    )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=60, ha="right", fontsize=7)
+    ax.set_ylabel("% unproductive junction reads")
+    ax.set_title(
+        "Unproductive splicing by tissue",
+        fontsize=11, fontweight="bold",
+    )
+    ax.text(
+        0.5, 1.01,
+        f"{n} tissues  |  weighted mean = {global_mean:.2f}%  |  median = {np.median(means):.2f}%",
+        transform=ax.transAxes, ha="center", fontsize=7, color="grey",
+    )
+    ax.set_xlim(-0.6, n - 0.4)
+    ax.set_ylim(bottom=0)
+    ax.grid(axis="y", linestyle="--", alpha=0.3, zorder=0)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _expand_star_files(patterns: List[str]) -> List[str]:
     """Expand globs and deduplicate while preserving order."""
     paths: List[str] = []
@@ -294,17 +561,34 @@ def main():
         max_intron_len=args.max_intron_len,
     )
 
-    # Save a tiny JSON summary
+    # Step 4: Per-tissue unproductive junction read analysis
+    samples_tsv = Path(args.samples_tsv) if args.samples_tsv else None
+    tissue_metrics = None
+    try:
+        tissue_metrics = compute_unproductive_by_tissue(
+            junction_counts_path=Path(lc2_outputs["junction_counts"]),
+            junction_filelist_path=junction_filelist,
+            outdir=outdir,
+            samples_tsv_path=samples_tsv,
+        )
+    except Exception as exc:
+        print(f"[WARN] Tissue unproductive analysis failed: {exc}")
+
+    # Save JSON summary
     summary = {
         "n_junction_inputs": len(bed_paths),
         "junction_file_list": str(junction_filelist),
         "lc2_outputs": lc2_outputs,
         "cluster_files": {
             "perind_counts": str(perind),
-            "perind_numers": str(perind_num)
+            "perind_numers": str(perind_num),
         },
-        "notes": "Core pipeline run complete. Use long_exon/nuc_rule outputs for NMD-focused downstream analysis."
+        "metrics": {},
+        "notes": "Core pipeline run complete. Use long_exon/nuc_rule outputs for NMD-focused downstream analysis.",
     }
+    if tissue_metrics:
+        summary["metrics"]["unproductive_by_tissue"] = tissue_metrics
+
     with open(outdir / "summary.json", "w") as fh:
         json.dump(summary, fh, indent=2)
     print("\nDone.")

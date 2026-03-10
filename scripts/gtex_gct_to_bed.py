@@ -97,6 +97,8 @@ def main() -> None:
     parser.add_argument("--outdir", required=True, help="Output directory")
     parser.add_argument("--min_count", type=int, default=1,
                         help="Minimum read count to emit a junction (default: 1)")
+    parser.add_argument("--max_samples_per_tissue", type=int, default=0,
+                        help="Cap number of samples per tissue (0 = unlimited)")
     args = parser.parse_args()
 
     gct_path = Path(args.gct)
@@ -104,6 +106,7 @@ def main() -> None:
     outdir = Path(args.outdir)
     requested: Set[str] = {t.strip() for t in args.tissues.split(",") if t.strip()}
     min_count = args.min_count
+    max_per_tissue = args.max_samples_per_tissue
 
     if not gct_path.exists():
         raise SystemExit(f"GCT not found: {gct_path}")
@@ -142,15 +145,23 @@ def main() -> None:
         # ---- 3. Identify columns that match requested tissues ----
         keep_col_indices: List[int] = []
         keep_sample_ids: List[str] = []
+        tissue_counts: Dict[str, int] = {}
         for i, sid in enumerate(gct_sample_ids):
             tissue = sample_tissue.get(sid)
             if tissue and tissue in requested:
+                n = tissue_counts.get(tissue, 0)
+                if max_per_tissue > 0 and n >= max_per_tissue:
+                    continue
+                tissue_counts[tissue] = n + 1
                 keep_col_indices.append(i)
                 keep_sample_ids.append(sid)
 
         if not keep_col_indices:
             raise SystemExit(f"No samples matched tissues {requested}")
-        print(f"[FILTER] {len(keep_col_indices):,} samples match")
+        cap_msg = f" (capped at {max_per_tissue}/tissue)" if max_per_tissue > 0 else ""
+        print(f"[FILTER] {len(keep_col_indices):,} samples match{cap_msg}")
+        for t, c in sorted(tissue_counts.items()):
+            print(f"  {t}: {c} samples")
 
         # ---- 4. Open per-sample BED file handles ----
         bed_paths: List[Path] = []
