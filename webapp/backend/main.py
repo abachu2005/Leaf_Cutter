@@ -967,7 +967,7 @@ async def create_job(
 
             sbatch_body = "\n".join(sbatch_preamble + [
                 (
-                    f"python3 scripts/lc2_pipeline.py"
+                    f"python3 {rr}/scripts/lc2_pipeline.py"
                     f" --workdir {remote_run_dir}"
                     f" --prefix {prefix}"
                     f" --leafcutter_repo {rr}/{leafcutter_repo}"

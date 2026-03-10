@@ -92,27 +92,66 @@ def convert_star_sj_to_bed(sj_tabs: List[Path], out_dir: Path) -> List[Path]:
 # LeafCutter clustering
 # ---------------------------
 
-def leafcutter_cluster(leafcutter_repo: Path, bed_paths: List[Path], out_prefix: Path, min_reads=50, max_intron_len=500000):
-    """Call LeafCutter clustering script (Python), using regtools BEDs list"""
-    cluster_script = leafcutter_repo / "clustering" / "leafcutter_cluster_regtools.py"
-    if not cluster_script.exists():
-        raise FileNotFoundError(f"LeafCutter clustering script not found at {cluster_script}")
-    filelist = write_junction_filelist(bed_paths, out_prefix.parent / (out_prefix.name + "_junction_files.txt"))
-    cmd = [
-        sys.executable, str(cluster_script),
-        "-j", str(filelist),
-        "-m", str(min_reads),
-        "-o", str(out_prefix),
-        "-l", str(max_intron_len)
+def _find_cluster_script(leafcutter_repo: Path, leafcutter2_repo: Optional[Path] = None) -> Optional[Path]:
+    """Search for a compatible LeafCutter clustering script."""
+    candidates = [
+        leafcutter_repo / "clustering" / "leafcutter_cluster_regtools.py",
+        leafcutter_repo / "scripts" / "leafcutter_cluster_regtools.py",
     ]
+    if leafcutter2_repo:
+        candidates.append(leafcutter2_repo / "scripts" / "leafcutter_make_clusters.py")
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def leafcutter_cluster(
+    leafcutter_repo: Path,
+    bed_paths: List[Path],
+    out_prefix: Path,
+    min_reads=50,
+    max_intron_len=500000,
+    leafcutter2_repo: Optional[Path] = None,
+):
+    """Call LeafCutter clustering script (Python), using regtools BEDs list.
+
+    Searches for the clustering script in the LC1 repo first, then falls back
+    to the LC2 repo's ``leafcutter_make_clusters.py`` which has a compatible
+    CLI.  Returns ``None`` if no clustering script is found.
+    """
+    cluster_script = _find_cluster_script(leafcutter_repo, leafcutter2_repo)
+    if cluster_script is None:
+        return None
+
+    filelist = write_junction_filelist(bed_paths, out_prefix.parent / (out_prefix.name + "_junction_files.txt"))
+
+    uses_rundir = "leafcutter_make_clusters" in cluster_script.name
+    if uses_rundir:
+        cmd = [
+            sys.executable, str(cluster_script),
+            "-j", str(filelist),
+            "-m", str(min_reads),
+            "-o", out_prefix.name,
+            "-r", str(out_prefix.parent) + "/",
+            "-l", str(max_intron_len),
+        ]
+    else:
+        cmd = [
+            sys.executable, str(cluster_script),
+            "-j", str(filelist),
+            "-m", str(min_reads),
+            "-o", str(out_prefix),
+            "-l", str(max_intron_len),
+        ]
     run(cmd)
 
-    # Expected outputs
     perind = out_prefix.with_name(out_prefix.name + "_perind.counts.gz")
     perind_num = out_prefix.with_name(out_prefix.name + "_perind_numers.counts.gz")
     if not perind.exists() or not perind_num.exists():
-        raise RuntimeError("LeafCutter clustering did not produce expected perind files.")
-    return perind, perind_num, filelist
+        print("[WARN] LeafCutter clustering did not produce expected perind files — continuing without them")
+        return filelist, None, None
+    return filelist, perind, perind_num
 
 # ---------------------------
 # LeafCutter2 classification
@@ -537,18 +576,30 @@ def main():
         check_exe("regtools")
         bed_paths = extract_junctions_from_bams([Path(p) for p in args.bams], jdir)
 
-    # Step 2: Cluster (LeafCutter)
+    # Step 2: Cluster (LeafCutter — optional)
+    # LC2 does its own clustering internally, so this step is optional.
+    # If the LC1 clustering script is available we run it for the perind
+    # outputs; otherwise we just write the junction filelist and let LC2
+    # handle clustering.
     prefix_path = cdir / args.prefix
-    perind, perind_num, junction_filelist = leafcutter_cluster(
+    junction_filelist = write_junction_filelist(
+        bed_paths, cdir / (args.prefix + "_junction_files.txt"),
+    )
+    perind = perind_num = None
+    cluster_result = leafcutter_cluster(
         Path(args.leafcutter_repo),
         bed_paths,
         prefix_path,
         min_reads=args.min_reads,
         max_intron_len=args.max_intron_len,
+        leafcutter2_repo=Path(args.leafcutter2_repo),
     )
+    if cluster_result is not None:
+        junction_filelist, perind, perind_num = cluster_result
+    else:
+        print("[INFO] No clustering script found — LeafCutter2 will cluster internally")
 
-    # Step 3: Classify (LeafCutter2) with the real CLI contract:
-    #   -j junction_list -r run_dir -o prefix -A gtf -G fasta
+    # Step 3: Classify (LeafCutter2 — does clustering + classification)
     lc2_prefix = args.prefix + "_lc2"
     lc2_outputs = leafcutter2_classify(
         Path(args.leafcutter2_repo),
@@ -579,13 +630,14 @@ def main():
         "n_junction_inputs": len(bed_paths),
         "junction_file_list": str(junction_filelist),
         "lc2_outputs": lc2_outputs,
-        "cluster_files": {
-            "perind_counts": str(perind),
-            "perind_numers": str(perind_num),
-        },
+        "cluster_files": {},
         "metrics": {},
         "notes": "Core pipeline run complete. Use long_exon/nuc_rule outputs for NMD-focused downstream analysis.",
     }
+    if perind:
+        summary["cluster_files"]["perind_counts"] = str(perind)
+    if perind_num:
+        summary["cluster_files"]["perind_numers"] = str(perind_num)
     if tissue_metrics:
         summary["metrics"]["unproductive_by_tissue"] = tissue_metrics
 
