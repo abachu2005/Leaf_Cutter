@@ -894,7 +894,6 @@ async def create_job(
         rr = remote_repo_root.rstrip("/")
         sbatch_preamble = [
             "#!/bin/bash",
-            "set -eo pipefail",
             f"#SBATCH --account={quest_account}",
             f"#SBATCH --partition={quest_partition}",
             "#SBATCH --time=48:00:00",
@@ -905,6 +904,7 @@ async def create_job(
             f"#SBATCH --output={remote_run_dir}/slurm_%j.out",
             f"#SBATCH --error={remote_run_dir}/slurm_%j.err",
             "",
+            "set -eo pipefail",
             f"cd {rr}",
             "module purge",
             "module load anaconda3/2022.05",
